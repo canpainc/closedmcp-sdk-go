@@ -2,7 +2,7 @@
 
 A small `net/http` wrapper for the [official Go MCP SDK](https://github.com/modelcontextprotocol/go-sdk). It checks each signed pass, serves protected-resource metadata, and attaches the verified person to the tool's context.
 
-Install with `go get github.com/canpainc/closedmcp-sdk-go@v0.1.0`. The module path is `github.com/canpainc/closedmcp-sdk-go`.
+Install with `go get github.com/canpainc/closedmcp-sdk-go@v0.1.1`. The module path is `github.com/canpainc/closedmcp-sdk-go`.
 
 For an existing official `*mcp.Server`, call `closedmcp.NewHandler(existingServer, options)` and serve the returned handler. For an existing mark3labs/mcp-go server, add these imports and wrap its Streamable HTTP handler:
 
@@ -65,6 +65,6 @@ The [runnable template](template/main.go) reads `MCP_URL`, `ALLOWED_DOMAINS` (co
 MCP_URL=https://example.com/mcp ALLOWED_DOMAINS=example.com go run ./template
 ```
 
-For local integration tests, set `CLOSEDMCP_ORIGIN` and `CLOSEDMCP_JWKS_URL`. By default, keys come from the public issuer's JWKS. The verifier caches keys for five minutes and fetches again when a new key ID appears.
+For local integration tests, set `CLOSEDMCP_ORIGIN` and `CLOSEDMCP_JWKS_URL`. By default, passes from `https://closedmcp.com` and the legacy `https://closedmcp.canpai.io` issuer use their respective JWKS endpoints. An explicit issuer accepts only that issuer. The verifier caches keys for five minutes and limits unknown key ID refetches to once every 30 seconds per issuer.
 
-See the [ClosedMCP documentation](https://closedmcp.canpai.io/docs).
+See the [ClosedMCP documentation](https://closedmcp.com/docs).

@@ -19,7 +19,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-const Issuer = "https://closedmcp.canpai.io"
+const Issuer = "https://closedmcp.com"
+
+const legacyIssuer = "https://closedmcp.canpai.io"
 
 type Person struct {
 	ID      string `json:"id"`
@@ -41,7 +43,7 @@ type Options struct {
 	Resource       string
 	AllowedDomains []string
 	Issuer         string // Defaults to the public ClosedMCP issuer.
-	JWKSURL        string // Defaults to Issuer + "/.well-known/jwks.json".
+	JWKSURL        string // Defaults to the selected issuer's JWKS endpoint.
 	HTTPClient     *http.Client
 }
 
@@ -50,8 +52,9 @@ type Verifier struct {
 	allowed                   map[string]bool
 	client                    *http.Client
 	mu                        sync.Mutex
-	keys                      jose.JSONWebKeySet
-	fetched                   time.Time
+	keys                      map[string]jose.JSONWebKeySet
+	fetched, attempted        map[string]time.Time
+	customIssuer, customJWKS  bool
 }
 
 // NewVerifier validates configuration before accepting requests.
@@ -85,18 +88,31 @@ func NewVerifier(opts Options) (*Verifier, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
-	return &Verifier{resource: opts.Resource, issuer: issuer, jwksURL: jwksURL, allowed: allowed, client: client}, nil
+	return &Verifier{resource: opts.Resource, issuer: issuer, jwksURL: jwksURL, allowed: allowed, client: client,
+		keys: make(map[string]jose.JSONWebKeySet), fetched: make(map[string]time.Time), attempted: make(map[string]time.Time),
+		customIssuer: opts.Issuer != "", customJWKS: opts.JWKSURL != ""}, nil
 }
 
-func (v *Verifier) key(ctx context.Context, kid string) ([]jose.JSONWebKey, error) {
+func (v *Verifier) key(ctx context.Context, issuer, kid string) ([]jose.JSONWebKey, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if time.Since(v.fetched) >= 5*time.Minute || len(v.keys.Key(kid)) == 0 {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, v.jwksURL, nil)
+	set := v.keys[issuer]
+	initial := v.fetched[issuer].IsZero() && time.Since(v.attempted[issuer]) >= 30*time.Second
+	stale := !v.fetched[issuer].IsZero() && time.Since(v.fetched[issuer]) >= 5*time.Minute && time.Since(v.attempted[issuer]) >= 30*time.Second
+	unknown := !v.fetched[issuer].IsZero() && len(set.Key(kid)) == 0 && time.Since(v.attempted[issuer]) >= 30*time.Second
+	if initial || stale || unknown {
+		v.attempted[issuer] = time.Now()
+		jwksURL := v.jwksURL
+		if issuer != v.issuer && !v.customJWKS {
+			jwksURL = issuer + "/.well-known/jwks.json"
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwksURL, nil)
 		if err != nil {
 			return nil, err
 		}
-		res, err := v.client.Do(req)
+		fetchCtx, cancel := context.WithTimeout(req.Context(), 5*time.Second)
+		defer cancel()
+		res, err := v.client.Do(req.WithContext(fetchCtx))
 		if err != nil {
 			return nil, err
 		}
@@ -108,9 +124,13 @@ func (v *Verifier) key(ctx context.Context, kid string) ([]jose.JSONWebKey, erro
 		if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&set); err != nil {
 			return nil, err
 		}
-		v.keys, v.fetched = set, time.Now()
+		v.keys[issuer], v.fetched[issuer] = set, time.Now()
+		if initial && len(set.Key(kid)) > 0 {
+			v.attempted[issuer] = time.Time{}
+		}
 	}
-	return v.keys.Key(kid), nil
+	set = v.keys[issuer]
+	return set.Key(kid), nil
 }
 
 type pass struct {
@@ -130,7 +150,12 @@ func (v *Verifier) Verify(ctx context.Context, authorization string) (Person, er
 	if err != nil || len(token.Headers) != 1 || token.Headers[0].KeyID == "" {
 		return Person{}, errors.New("invalid sign-in token")
 	}
-	keys, err := v.key(ctx, token.Headers[0].KeyID)
+	var unverified jwt.Claims
+	if err := token.UnsafeClaimsWithoutVerification(&unverified); err != nil ||
+		(unverified.Issuer != v.issuer && (v.customIssuer || unverified.Issuer != legacyIssuer)) {
+		return Person{}, errors.New("invalid sign-in token")
+	}
+	keys, err := v.key(ctx, unverified.Issuer, token.Headers[0].KeyID)
 	if err != nil {
 		return Person{}, err
 	}
@@ -144,10 +169,10 @@ func (v *Verifier) Verify(ctx context.Context, authorization string) (Person, er
 			continue
 		}
 		now := time.Now()
-		if claims.Issuer != v.issuer || len(claims.Audience) != 1 || claims.Audience[0] != v.resource || claims.Subject == "" || claims.ID == "" || claims.IssuedAt == nil || claims.Expiry == nil || identity.Email == "" || identity.Domain == "" || identity.Org == "" || !v.allowed[strings.ToLower(identity.Domain)] {
+		if claims.Issuer != unverified.Issuer || len(claims.Audience) != 1 || claims.Audience[0] != v.resource || claims.Subject == "" || claims.ID == "" || claims.IssuedAt == nil || claims.Expiry == nil || identity.Email == "" || identity.Domain == "" || identity.Org == "" || !v.allowed[strings.ToLower(identity.Domain)] {
 			continue
 		}
-		if err := claims.Validate(jwt.Expected{Issuer: v.issuer, AnyAudience: jwt.Audience{v.resource}, Time: now}); err != nil {
+		if err := claims.Validate(jwt.Expected{Issuer: unverified.Issuer, AnyAudience: jwt.Audience{v.resource}, Time: now}); err != nil {
 			continue
 		}
 		issued, expires := claims.IssuedAt.Time(), claims.Expiry.Time()

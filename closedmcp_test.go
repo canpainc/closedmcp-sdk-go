@@ -56,6 +56,10 @@ func (f *fixture) options() closedmcp.Options {
 }
 
 func (f *fixture) token(t *testing.T, changes map[string]any, private ed25519.PrivateKey) string {
+	return f.tokenKID(t, changes, private, "test-key")
+}
+
+func (f *fixture) tokenKID(t *testing.T, changes map[string]any, private ed25519.PrivateKey, kid string) string {
 	t.Helper()
 	if private == nil {
 		private = f.private
@@ -69,7 +73,7 @@ func (f *fixture) token(t *testing.T, changes map[string]any, private ed25519.Pr
 			claims[k] = v
 		}
 	}
-	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.EdDSA, Key: jose.JSONWebKey{Key: private, KeyID: "test-key"}}, nil)
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.EdDSA, Key: jose.JSONWebKey{Key: private, KeyID: kid}}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,6 +82,65 @@ func (f *fixture) token(t *testing.T, changes map[string]any, private ed25519.Pr
 		t.Fatal(err)
 	}
 	return token
+}
+
+func TestDefaultIssuers(t *testing.T) {
+	f := newFixture(t)
+	var requested []string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requested = append(requested, r.URL.String())
+		copy := r.Clone(r.Context())
+		copy.URL.Scheme, copy.URL.Host = "http", strings.TrimPrefix(f.jwks.URL, "http://")
+		return http.DefaultTransport.RoundTrip(copy)
+	})}
+	opts := f.options()
+	opts.Issuer, opts.JWKSURL, opts.HTTPClient = "", "", client
+	v, err := closedmcp.NewVerifier(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, issuer := range []string{closedmcp.Issuer, "https://closedmcp.canpai.io"} {
+		if _, err := v.Verify(context.Background(), "Bearer "+f.token(t, map[string]any{"iss": issuer}, nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(requested) != 2 || requested[0] != closedmcp.Issuer+"/.well-known/jwks.json" || requested[1] != "https://closedmcp.canpai.io/.well-known/jwks.json" {
+		t.Fatalf("JWKS requests = %v", requested)
+	}
+	if _, err := v.Verify(context.Background(), "Bearer "+f.token(t, map[string]any{"iss": "https://other.example"}, nil)); err == nil {
+		t.Fatal("accepted other issuer")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestUnknownKIDCooldown(t *testing.T) {
+	f := newFixture(t)
+	requests := 0
+	opts := f.options()
+	opts.HTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+	v, err := closedmcp.NewVerifier(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := "Bearer " + f.token(t, nil, nil)
+	if _, err := v.Verify(context.Background(), valid); err != nil {
+		t.Fatal(err)
+	}
+	unknown := "Bearer " + f.tokenKID(t, nil, nil, "new-key")
+	for range 3 {
+		if _, err := v.Verify(context.Background(), unknown); err == nil {
+			t.Fatal("accepted unknown key")
+		}
+	}
+	if requests != 2 {
+		t.Fatalf("JWKS requests = %d, want 2", requests)
+	}
 }
 
 func TestVerifier(t *testing.T) {
@@ -107,7 +170,7 @@ func TestVerifier(t *testing.T) {
 		"bad signature":      f.token(t, nil, badPrivate),
 		"missing email":      f.token(t, map[string]any{"email": nil}, nil),
 		"missing id":         f.token(t, map[string]any{"jti": nil}, nil),
-		"wrong issuer":       f.token(t, map[string]any{"iss": "https://other.example"}, nil),
+		"wrong issuer":       f.token(t, map[string]any{"iss": closedmcp.Issuer}, nil),
 		"future issue":       f.token(t, map[string]any{"iat": now + 300, "exp": now + 600}, nil),
 	}
 	for name, token := range cases {
