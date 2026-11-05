@@ -65,7 +65,7 @@ func (f *fixture) tokenKID(t *testing.T, changes map[string]any, private ed25519
 		private = f.private
 	}
 	now := time.Now().Unix()
-	claims := map[string]any{"iss": f.issuer, "aud": f.resource, "sub": "person-123", "email": emailOne, "domain": "example.com", "org": "acme", "client": "Test app", "iat": now, "exp": now + 300, "jti": "pass-123"}
+	claims := map[string]any{"iss": f.issuer, "aud": f.resource, "sub": "person-123", "email": emailOne, "domain": "example.com", "org": "acme", "client": "Test app", "iat": now, "exp": now + 300, "jti": "pass-123", "client_id": "test-client", "scope": "mcp:tools"}
 	for k, v := range changes {
 		if v == nil {
 			delete(claims, k)
@@ -73,7 +73,18 @@ func (f *fixture) tokenKID(t *testing.T, changes map[string]any, private ed25519
 			claims[k] = v
 		}
 	}
-	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.EdDSA, Key: jose.JSONWebKey{Key: private, KeyID: kid}}, nil)
+	for _, name := range []string{"domain", "org", "client"} {
+		if value, ok := claims[name]; ok {
+			claims["https://closedmcp.com/claims/"+name] = value
+			delete(claims, name)
+		}
+	}
+	typ := "at+jwt"
+	if value, ok := claims["typ"].(string); ok {
+		typ = value
+		delete(claims, "typ")
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.EdDSA, Key: jose.JSONWebKey{Key: private, KeyID: kid}}, (&jose.SignerOptions{}).WithType(jose.ContentType(typ)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,12 +110,12 @@ func TestDefaultIssuers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, issuer := range []string{closedmcp.Issuer, "https://closedmcp.canpai.io"} {
+	for _, issuer := range []string{closedmcp.Issuer} {
 		if _, err := v.Verify(context.Background(), "Bearer "+f.token(t, map[string]any{"iss": issuer}, nil)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if len(requested) != 2 || requested[0] != closedmcp.Issuer+"/.well-known/jwks.json" || requested[1] != "https://closedmcp.canpai.io/.well-known/jwks.json" {
+	if len(requested) != 1 || requested[0] != closedmcp.Issuer+"/.well-known/jwks.json" {
 		t.Fatalf("JWKS requests = %v", requested)
 	}
 	if _, err := v.Verify(context.Background(), "Bearer "+f.token(t, map[string]any{"iss": "https://other.example"}, nil)); err == nil {
@@ -166,6 +177,10 @@ func TestVerifier(t *testing.T) {
 		"multiple audiences": f.token(t, map[string]any{"aud": []string{f.resource, "https://other.example/mcp"}}, nil),
 		"expired":            f.token(t, map[string]any{"iat": now - 601, "exp": now - 301}, nil),
 		"overlong":           f.token(t, map[string]any{"exp": now + 301}, nil),
+		"old pass":           f.token(t, map[string]any{"typ": "JWT"}, nil),
+		"missing client":     f.token(t, map[string]any{"client_id": nil}, nil),
+		"wrong scope":        f.token(t, map[string]any{"scope": "admin"}, nil),
+		"legacy issuer":      f.token(t, map[string]any{"iss": "https://closedmcp.canpai.io"}, nil),
 		"disallowed company": f.token(t, map[string]any{"domain": "other.example"}, nil),
 		"bad signature":      f.token(t, nil, badPrivate),
 		"missing email":      f.token(t, map[string]any{"email": nil}, nil),
@@ -218,6 +233,9 @@ func call(t *testing.T, client *http.Client, base, token, method, params string,
 				break
 			}
 		}
+	}
+	if res.StatusCode != http.StatusOK && !strings.Contains(res.Header.Get("Content-Type"), "json") {
+		return res.StatusCode, map[string]any{"error": string(data)}, res.Header
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(data, &decoded); err != nil {
@@ -273,8 +291,12 @@ func TestHandlerAndConcurrentPeople(t *testing.T) {
 		t.Fatalf("metadata = %+v", metadata)
 	}
 	status, _, headers := call(t, httpServer.Client(), httpServer.URL, "", "initialize", `{}`, 1)
-	if status != 401 || headers.Get("WWW-Authenticate") != `Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource/mcp"` {
+	if status != 401 || headers.Get("WWW-Authenticate") != `Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource/mcp", scope="mcp:tools"` {
 		t.Fatalf("missing pass: %d %+v", status, headers)
+	}
+	scopeStatus, _, _ := call(t, httpServer.Client(), httpServer.URL, f.token(t, map[string]any{"scope": "other"}, nil), "tools/list", `{}`, 4)
+	if scopeStatus != 403 {
+		t.Fatalf("wrong scope: %d", scopeStatus)
 	}
 	type answer struct {
 		text   string
