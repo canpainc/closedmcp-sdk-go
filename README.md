@@ -2,7 +2,15 @@
 
 A small `net/http` wrapper for the [official Go MCP SDK](https://github.com/modelcontextprotocol/go-sdk). It checks each signed pass, serves protected-resource metadata, and attaches the verified person to the tool's context.
 
-Install with `go get github.com/canpainc/closedmcp-sdk-go@v0.1.1`. The module path is `github.com/canpainc/closedmcp-sdk-go`.
+The public wrapper in 0.2.0 accepts OAuth resource access tokens with type `at+jwt`, a
+`client_id`, the `mcp:tools` scope and an audience matching the configured MCP URL.
+Company claims use the `https://closedmcp.com/claims/` namespace; the person helper
+keeps its existing fields. Old pass tokens and the implicit legacy issuer are
+rejected. The token follows RFC9068's claims and type using EdDSA; its mandatory
+RS256 support is not implemented. This is MCP OAuth, not ID-JAG/enterprise-managed
+authorization. Hosted caller helpers use their separate private contract.
+
+Install with `go get github.com/canpainc/closedmcp-sdk-go@v0.2.0`. The module path is `github.com/canpainc/closedmcp-sdk-go`.
 
 For an existing official `*mcp.Server`, call `closedmcp.NewHandler(existingServer, options)` and serve the returned handler. For an existing mark3labs/mcp-go server, add these imports and wrap its Streamable HTTP handler:
 
@@ -65,6 +73,6 @@ The [runnable template](template/main.go) reads `MCP_URL`, `ALLOWED_DOMAINS` (co
 MCP_URL=https://example.com/mcp ALLOWED_DOMAINS=example.com go run ./template
 ```
 
-For local integration tests, set `CLOSEDMCP_ORIGIN` and `CLOSEDMCP_JWKS_URL`. By default, passes from `https://closedmcp.com` and the legacy `https://closedmcp.canpai.io` issuer use their respective JWKS endpoints. An explicit issuer accepts only that issuer. The verifier caches keys for five minutes and limits unknown key ID refetches to once every 30 seconds per issuer.
+For local integration tests, set `CLOSEDMCP_ORIGIN` and `CLOSEDMCP_JWKS_URL`. By default, only `https://closedmcp.com` is trusted. An explicit issuer accepts only that issuer. The verifier caches keys for five minutes and limits unknown key ID refetches to once every 30 seconds per issuer.
 
 See the [ClosedMCP documentation](https://closedmcp.com/docs).

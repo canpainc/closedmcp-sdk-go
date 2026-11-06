@@ -16,12 +16,13 @@ import (
 
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 const Issuer = "https://closedmcp.com"
 
-const legacyIssuer = "https://closedmcp.canpai.io"
+const RequiredScope = "mcp:tools"
 
 type Person struct {
 	ID      string `json:"id"`
@@ -54,7 +55,6 @@ type Verifier struct {
 	mu                        sync.Mutex
 	keys                      map[string]jose.JSONWebKeySet
 	fetched, attempted        map[string]time.Time
-	customIssuer, customJWKS  bool
 }
 
 // NewVerifier validates configuration before accepting requests.
@@ -89,8 +89,7 @@ func NewVerifier(opts Options) (*Verifier, error) {
 		client = &http.Client{Timeout: 5 * time.Second}
 	}
 	return &Verifier{resource: opts.Resource, issuer: issuer, jwksURL: jwksURL, allowed: allowed, client: client,
-		keys: make(map[string]jose.JSONWebKeySet), fetched: make(map[string]time.Time), attempted: make(map[string]time.Time),
-		customIssuer: opts.Issuer != "", customJWKS: opts.JWKSURL != ""}, nil
+		keys: make(map[string]jose.JSONWebKeySet), fetched: make(map[string]time.Time), attempted: make(map[string]time.Time)}, nil
 }
 
 func (v *Verifier) key(ctx context.Context, issuer, kid string) ([]jose.JSONWebKey, error) {
@@ -103,9 +102,6 @@ func (v *Verifier) key(ctx context.Context, issuer, kid string) ([]jose.JSONWebK
 	if initial || stale || unknown {
 		v.attempted[issuer] = time.Now()
 		jwksURL := v.jwksURL
-		if issuer != v.issuer && !v.customJWKS {
-			jwksURL = issuer + "/.well-known/jwks.json"
-		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwksURL, nil)
 		if err != nil {
 			return nil, err
@@ -134,30 +130,52 @@ func (v *Verifier) key(ctx context.Context, issuer, kid string) ([]jose.JSONWebK
 }
 
 type pass struct {
-	Email  string  `json:"email"`
-	Domain string  `json:"domain"`
-	Org    string  `json:"org"`
-	Client *string `json:"client"`
+	ClientID string  `json:"client_id"`
+	Scope    string  `json:"scope"`
+	Email    string  `json:"email"`
+	Domain   string  `json:"https://closedmcp.com/claims/domain"`
+	Org      string  `json:"https://closedmcp.com/claims/org"`
+	Client   *string `json:"https://closedmcp.com/claims/client"`
 }
 
-// Verify checks a Bearer pass and returns its identity.
+// Verify checks an access token and returns its verified person.
 func (v *Verifier) Verify(ctx context.Context, authorization string) (Person, error) {
 	fields := strings.Fields(authorization)
 	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
-		return Person{}, errors.New("no sign-in token")
+		return Person{}, auth.ErrInvalidToken
 	}
-	token, err := jwt.ParseSigned(fields[1], []jose.SignatureAlgorithm{jose.EdDSA})
-	if err != nil || len(token.Headers) != 1 || token.Headers[0].KeyID == "" {
-		return Person{}, errors.New("invalid sign-in token")
-	}
-	var unverified jwt.Claims
-	if err := token.UnsafeClaimsWithoutVerification(&unverified); err != nil ||
-		(unverified.Issuer != v.issuer && (v.customIssuer || unverified.Issuer != legacyIssuer)) {
-		return Person{}, errors.New("invalid sign-in token")
-	}
-	keys, err := v.key(ctx, unverified.Issuer, token.Headers[0].KeyID)
+	info, err := v.verifyToken(ctx, fields[1], nil)
 	if err != nil {
 		return Person{}, err
+	}
+	permitted := false
+	for _, scope := range info.Scopes {
+		if scope == RequiredScope {
+			permitted = true
+		}
+	}
+	if !permitted {
+		return Person{}, errors.New("insufficient scope")
+	}
+	return info.Extra["closedMcpPerson"].(Person), nil
+}
+
+func (v *Verifier) verifyToken(ctx context.Context, raw string, _ *http.Request) (*auth.TokenInfo, error) {
+	token, err := jwt.ParseSigned(raw, []jose.SignatureAlgorithm{jose.EdDSA})
+	if err != nil || len(token.Headers) != 1 || token.Headers[0].KeyID == "" {
+		return nil, auth.ErrInvalidToken
+	}
+	typ := token.Headers[0].ExtraHeaders[jose.HeaderType]
+	if typ != "at+jwt" && typ != "application/at+jwt" {
+		return nil, auth.ErrInvalidToken
+	}
+	var unverified jwt.Claims
+	if err := token.UnsafeClaimsWithoutVerification(&unverified); err != nil || unverified.Issuer != v.issuer {
+		return nil, auth.ErrInvalidToken
+	}
+	keys, err := v.key(ctx, v.issuer, token.Headers[0].KeyID)
+	if err != nil {
+		return nil, auth.ErrInvalidToken
 	}
 	for _, key := range keys {
 		if _, ok := key.Key.(ed25519.PublicKey); !ok || (key.Algorithm != "" && key.Algorithm != "EdDSA") || (key.Use != "" && key.Use != "sig") {
@@ -169,10 +187,10 @@ func (v *Verifier) Verify(ctx context.Context, authorization string) (Person, er
 			continue
 		}
 		now := time.Now()
-		if claims.Issuer != unverified.Issuer || len(claims.Audience) != 1 || claims.Audience[0] != v.resource || claims.Subject == "" || claims.ID == "" || claims.IssuedAt == nil || claims.Expiry == nil || identity.Email == "" || identity.Domain == "" || identity.Org == "" || !v.allowed[strings.ToLower(identity.Domain)] {
+		if claims.Issuer != v.issuer || len(claims.Audience) != 1 || claims.Audience[0] != v.resource || claims.Subject == "" || claims.ID == "" || claims.IssuedAt == nil || claims.Expiry == nil || identity.Email == "" || identity.Domain == "" || identity.Org == "" || identity.ClientID == "" || !v.allowed[strings.ToLower(identity.Domain)] {
 			continue
 		}
-		if err := claims.Validate(jwt.Expected{Issuer: unverified.Issuer, AnyAudience: jwt.Audience{v.resource}, Time: now}); err != nil {
+		if err := claims.ValidateWithLeeway(jwt.Expected{Issuer: v.issuer, AnyAudience: jwt.Audience{v.resource}, Time: now}, 0); err != nil {
 			continue
 		}
 		issued, expires := claims.IssuedAt.Time(), claims.Expiry.Time()
@@ -183,9 +201,10 @@ func (v *Verifier) Verify(ctx context.Context, authorization string) (Person, er
 		if identity.Client != nil {
 			person.AIApp = *identity.Client
 		}
-		return person, nil
+		return &auth.TokenInfo{Scopes: strings.Fields(identity.Scope), Expiration: expires, UserID: claims.Subject,
+			Extra: map[string]any{"closedMcpPerson": person, "client_id": identity.ClientID}}, nil
 	}
-	return Person{}, errors.New("invalid sign-in token")
+	return nil, auth.ErrInvalidToken
 }
 
 // NewHandler protects every MCP request and serves OAuth protected-resource metadata.
@@ -222,7 +241,18 @@ func NewHTTPHandler(mcpHandler http.Handler, opts Options) (http.Handler, error)
 		Resource             string   `json:"resource"`
 		AuthorizationServers []string `json:"authorization_servers"`
 		BearerMethods        []string `json:"bearer_methods_supported"`
-	}{opts.Resource, []string{verifier.issuer}, []string{"header"}}
+		Scopes               []string `json:"scopes_supported"`
+	}{opts.Resource, []string{verifier.issuer}, []string{"header"}, []string{RequiredScope}}
+	protected := auth.RequireBearerToken(verifier.verifyToken, &auth.RequireBearerTokenOptions{
+		ResourceMetadataURL: metadataURL, Scopes: []string{RequiredScope},
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		person := auth.TokenInfoFromContext(r.Context()).Extra["closedMcpPerson"].(Person)
+		mcpHandler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), personKey{}, person)))
+	}))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && (r.URL.Path == metadataPath || r.URL.Path == "/.well-known/oauth-protected-resource") {
 			w.Header().Set("Content-Type", "application/json")
@@ -235,20 +265,6 @@ func NewHTTPHandler(mcpHandler http.Handler, opts Options) (http.Handler, error)
 			_, _ = io.WriteString(w, `{"error":"not found"}`)
 			return
 		}
-		person, err := verifier.Verify(r.Context(), r.Header.Get("Authorization"))
-		if err != nil {
-			w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+metadataURL+`"`)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = io.WriteString(w, `{"error":"unauthorized"}`)
-			return
-		}
-		if r.Method != http.MethodPost {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			_, _ = io.WriteString(w, `{"error":"method not allowed"}`)
-			return
-		}
-		mcpHandler.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), personKey{}, person)))
+		protected.ServeHTTP(w, r)
 	}), nil
 }
